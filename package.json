@@ -1,0 +1,31 @@
+{
+  "name": "ecs-go",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "build:web": "turbo run build --filter=web",
+    "build:api": "turbo run build --filter=api",
+    "dev": "turbo run dev --filter=web --filter=api",
+    "backend": "npm run start --prefix apps/api",
+    "dev:web": "turbo dev --filter=web",
+    "dev:api": "turbo dev --filter=api",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "type-check": "turbo run type-check",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f db"
+  },
+  "devDependencies": {
+    "@trivago/prettier-plugin-sort-imports": "^5.2.2",
+    "@types/node": "^20.17.52",
+    "cross-env": "^10.1.0",
+    "turbo": "^2.6.1",
+    "typescript": "^5.8.3"
+  },
+  "packageManager": "npm@10.8.2"
+}

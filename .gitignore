@@ -1,0 +1,41 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Build outputs
+**/dist/
+**/out/
+**/.next/
+
+# Turbo
+**/.turbo/
+
+# Go
+apps/api/server
+apps/api/*.exe
+apps/api/go.sum
+
+# CDK
+infra/cdk.out/
+infra/cdk.out.bootstrap/
+infra/dist/
+
+# Env
+.env
+.env.local
+.env.production
+.env.development
+!.env.example
+
+# Docker
+apps/api/docker-compose.override.yml
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+/.claude/settings.local.json

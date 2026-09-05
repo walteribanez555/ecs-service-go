@@ -1,0 +1,293 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+        default: dev
+
+concurrency:
+  group: deploy-${{ github.event_name == 'workflow_dispatch' && inputs.environment || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: read
+
+jobs:
+  # ============================================================================
+  # DETECT CHANGES
+  # ============================================================================
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      infra: ${{ steps.filter.outputs.infra }}
+      environment: ${{ steps.env.outputs.environment }}
+      stack_name: ${{ steps.env.outputs.stack_name }}
+    steps:
+      - name: Set environment context
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ inputs.environment }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ENV="prod"
+          else
+            ENV="dev"
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "stack_name=EcsGoStack-$(echo $ENV | sed 's/.*/\u&/')" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'apps/api/**'
+              - '.dockerignore'
+            infra:
+              - 'infra/**'
+
+  # ============================================================================
+  # PR VALIDATION — build only, no push
+  # ============================================================================
+  build-pr:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.api == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+
+      - name: Build
+        working-directory: apps/api
+        run: go build ./...
+
+      - name: Test
+        working-directory: apps/api
+        run: go test ./...
+
+  # ============================================================================
+  # BUILD & PUSH IMAGE TO ECR
+  # ============================================================================
+  build-api:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: >
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/tags/v') ||
+       github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.api == 'true' || github.event_name == 'workflow_dispatch')
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: api
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/ecs-go-api-${{ needs.changes.outputs.environment }}:${{ steps.tag.outputs.tag }}
+            ${{ steps.login-ecr.outputs.registry }}/ecs-go-api-${{ needs.changes.outputs.environment }}:${{ needs.changes.outputs.environment }}-latest
+          cache-from: type=gha,scope=docker-api
+          cache-to: type=gha,scope=docker-api,mode=max
+
+  # ============================================================================
+  # DEPLOY CDK INFRA (only if infra changed)
+  # ============================================================================
+  deploy-infra:
+    runs-on: ubuntu-latest
+    needs: [changes, build-api]
+    if: |
+      always() &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') &&
+      needs.changes.outputs.infra == 'true' &&
+      (needs.build-api.result == 'success' || needs.build-api.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Deploy CDK Stack
+        working-directory: infra
+        env:
+          ENVIRONMENT: ${{ needs.changes.outputs.environment }}
+          STACK_NAME: ${{ needs.changes.outputs.stack_name }}
+        run: |
+          npm ci --no-audit --no-fund
+          npm run cdk deploy $STACK_NAME -- --context environment=$ENVIRONMENT --require-approval never
+
+  # ============================================================================
+  # DEPLOY TO ECS
+  # ============================================================================
+  deploy-api:
+    runs-on: ubuntu-latest
+    needs: [changes, build-api, deploy-infra]
+    if: |
+      always() &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') &&
+      needs.build-api.result == 'success' &&
+      (needs.deploy-infra.result == 'success' || needs.deploy-infra.result == 'skipped')
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Deploy API to ECS
+        env:
+          ENVIRONMENT: ${{ needs.changes.outputs.environment }}
+        run: |
+          echo "Deploying API to ecs-go-cluster-$ENVIRONMENT..."
+
+          aws ecs update-service \
+            --cluster ecs-go-cluster-$ENVIRONMENT \
+            --service api-service-$ENVIRONMENT \
+            --force-new-deployment
+
+          echo "Waiting for deployment to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ecs-go-cluster-$ENVIRONMENT \
+            --services api-service-$ENVIRONMENT \
+            --cli-read-timeout 600
+
+          DEPLOYMENT_STATUS=$(aws ecs describe-services \
+            --cluster ecs-go-cluster-$ENVIRONMENT \
+            --services api-service-$ENVIRONMENT \
+            --query 'services[0].deployments[0].status' --output text)
+
+          echo "Deployment status: $DEPLOYMENT_STATUS"
+
+          if [ "$DEPLOYMENT_STATUS" != "PRIMARY" ]; then
+            echo "Deployment failed"
+            exit 1
+          fi
+
+          echo "API deployment completed successfully"
+
+  # ============================================================================
+  # POST-DEPLOY HEALTH CHECK
+  # ============================================================================
+  post-deploy-health:
+    runs-on: ubuntu-latest
+    needs: [deploy-api, changes]
+    if: needs.deploy-api.result == 'success'
+    steps:
+      - name: Health check
+        env:
+          ENVIRONMENT: ${{ needs.changes.outputs.environment }}
+        run: |
+          LB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name EcsGoStack-$(echo $ENVIRONMENT | sed 's/.*/\u&/') \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiLoadBalancerDns'].OutputValue" \
+            --output text)
+
+          echo "Checking health at http://$LB_DNS/health"
+
+          for i in {1..5}; do
+            if curl -f -m 10 "http://$LB_DNS/health"; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "Health check failed after 5 attempts"
+          exit 1
+
+  # ============================================================================
+  # TAG RELEASE (prod only)
+  # ============================================================================
+  tag-release:
+    runs-on: ubuntu-latest
+    needs: [post-deploy-health, changes]
+    if: >
+      needs.post-deploy-health.result == 'success' &&
+      needs.changes.outputs.environment == 'prod' &&
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create release tag
+        run: |
+          git fetch --tags
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          if [[ "$LAST_TAG" =~ v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            MINOR=$(( ${BASH_REMATCH[2]} + 1 ))
+            TAG_NAME="v${BASH_REMATCH[1]}.${MINOR}.0"
+          else
+            TAG_NAME="v1.0.0"
+          fi
+
+          echo "Creating release: $TAG_NAME"
+          git tag -a "$TAG_NAME" -m "Production Release - $(date +%Y-%m-%d)"
+          git push origin "$TAG_NAME"
