@@ -2,6 +2,10 @@
 
 A Go REST API deployed on **AWS ECS Fargate**, with infrastructure defined as code using **AWS CDK (TypeScript)** and a full CI/CD pipeline via **GitHub Actions**.
 
+## TODO
+
+- [ ] **Database** — connect the API to PostgreSQL: add RDS in `EcsGoBaseStack`, pass credentials via Secrets Manager to the Fargate service, and run schema migrations on container startup.
+
 ---
 
 ## Project Structure
